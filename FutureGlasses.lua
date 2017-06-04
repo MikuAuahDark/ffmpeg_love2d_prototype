@@ -20,8 +20,15 @@ int av_opt_set_sample_fmt(void *obj, const char *name, enum AVSampleFormat fmt, 
 
 typedef struct SwrContext SwrContext;
 struct SwrContext *swr_alloc(void);
+struct SwrContext *swr_alloc_set_opts(struct SwrContext *s,
+                                      int64_t out_ch_layout, enum AVSampleFormat out_sample_fmt, int out_sample_rate,
+                                      int64_t  in_ch_layout, enum AVSampleFormat  in_sample_fmt, int  in_sample_rate,
+                                      int log_offset, void *log_ctx);
 int swr_init(struct SwrContext *s);
 void swr_free(struct SwrContext **s);
+int swr_convert(struct SwrContext *s, uint8_t **out, int out_count,
+                                const uint8_t **in , int in_count);
+int64_t swr_get_delay(struct SwrContext *s, int64_t base);
 ]]
 avformat.av_register_all()
 avcodec.avcodec_register_all()
@@ -41,6 +48,7 @@ end
 function FutureGlasses._mt.Play(this)
 	if this.Playing then return end
 	
+	if this.AudioSource then this.AudioSource:play() end
 	this.Playing = true
 	FutureGlasses._playing[#FutureGlasses._playing + 1] = this
 end
@@ -48,6 +56,7 @@ end
 function FutureGlasses._mt.Pause(this)
 	if this.Playing == false then return end
 	
+	if this.AudioSource then this.AudioSource:pause() end
 	for i = 1, #FutureGlasses._playing do
 		if FutureGlasses._playing[i] == this then
 			this.Playing = false
@@ -134,16 +143,90 @@ function FutureGlasses.OpenVideo(path, loadaudio)
 		temp.SoundData = love.sound.newSoundData(SampleCountLove2D, 44100, 16, 2)
 		temp.SoundDataPointer = temp.SoundData:getPointer()
 		temp.SwrCtx = ffi.new("SwrContext*[1]")
-		temp.SwrCtx[0] = swresample.swr_alloc();
-		
-		avutil.av_opt_set_int(temp.SwrCtx[0], "in_channel_layout", temp.AudioStream.codec.channel_layout, 0);
-		avutil.av_opt_set_int(temp.SwrCtx[0], "out_channel_layout", 3, 0);
-		avutil.av_opt_set_int(temp.SwrCtx[0], "in_sample_rate", temp.AudioStream.codec.sample_rate, 0);
-		avutil.av_opt_set_int(temp.SwrCtx[0], "out_sample_rate", 44100, 0);
-		avutil.av_opt_set_sample_fmt(temp.SwrCtx[0], "in_sample_fmt", temp.AudioStream.codec.sample_fmt, 0);
-		avutil.av_opt_set_sample_fmt(temp.SwrCtx[0], "out_sample_fmt", 2, 0);
-		
+		temp.SwrCtx[0] = swresample.swr_alloc_set_opts(nil,
+			3,
+			"AV_SAMPLE_FMT_S16",
+			44100,
+			temp.AudioStream.codec.channel_layout,
+			temp.AudioStream.codec.sample_fmt,
+			temp.AudioStream.codec.sample_rate,
+			0, nil
+		)
 		null_assert(swresample.swr_init(temp.SwrCtx[0]) >= 0, "Failed to initialize swresample")
+		
+		local ACodec = avcodec.avcodec_find_decoder(temp.AudioStream.codec.codec_id)
+		null_assert(ACodec ~= nil, "Can't find audio codec")
+		
+		local AudioCodecContext = avcodec.avcodec_alloc_context3(ACodec)
+		
+		if avcodec.avcodec_copy_context(AudioCodecContext, temp.AudioStream.codec) < 0 then
+			avcodec.avcodec_close(AudioCodecContext)
+			null_assert(false, "Failed to copy context")
+		end
+		
+		if avcodec.avcodec_open2(AudioCodecContext, ACodec, nil) < 0 then
+			avcodec.avcodec_close(AudioCodecContext)
+			null_assert(false, "Cannot open codec")
+		end
+		
+		local AudioFrame = avutil.av_frame_alloc()
+		if AudioFrame == nil then
+			avcodec.avcodec_close(AudioCodecContext)
+			null_assert(false, "Failed to initialize frame")
+		end
+		
+		local outbuf = ffi.new("uint8_t*[2]")
+		local packet = ffi.new("AVPacket[1]")
+		local framefinished = ffi.new("int[1]")
+		local out_size = SampleCountLove2D
+		
+		outbuf[0] = ffi.cast("uint8_t*", temp.SoundDataPointer)
+		
+		local readframe = avformat.av_read_frame(temp.FmtContext[0], packet)
+		while readframe >= 0 do
+			if packet[0].stream_index == temp.AudioStreamIndex then
+				local decodelen = avcodec.avcodec_decode_audio4(AudioCodecContext, AudioFrame, framefinished, packet)
+				
+				if decodelen < 0 then
+					avcodec.av_free_packet(packet)
+					avcodec.avcodec_close(AudioCodecContext)
+					avcodec.avcodec_close(ACodec)
+					null_assert(false, "Audio decoding error")
+				end
+				
+				if framefinished[0] > 0 then
+					local samples = swresample.swr_convert(temp.SwrCtx[0],
+						outbuf, AudioFrame.nb_samples,
+						ffi.cast("const uint8_t**", AudioFrame.extended_data),
+						AudioFrame.nb_samples
+					)
+					
+					if samples < 0 then
+						avcodec.av_free_packet(packet)
+						avcodec.avcodec_close(AudioCodecContext)
+						avcodec.avcodec_close(ACodec)
+						null_assert(false, "Resample error")
+					end
+					
+					outbuf[0] = outbuf[0] + samples * 4
+					out_size = out_size - samples
+				end
+			end
+			
+			avcodec.av_free_packet(packet)
+			readframe = avformat.av_read_frame(temp.FmtContext[0], packet)
+		end
+		avcodec.avcodec_close(AudioCodecContext)
+		
+		-- Flush buffer
+		swresample.swr_convert(temp.SwrCtx[0], outbuf, out_size, nil, 0)
+		
+		if avformat.av_seek_frame(temp.FmtContext[0], -1, 0LL, 1) < 0 then
+			null_assert(false, "Seek error")
+		end
+		
+		-- Create source
+		temp.AudioSource = love.audio.newSource(temp.SoundData)
 	end
 	
 	-- Find decoder
@@ -206,10 +289,8 @@ function FutureGlasses.Update(deltaT)
 			framefinished[0] = 0
 			
 			local readframe = avformat.av_read_frame(obj.FmtContext[0], packet)
-			local stop_decode = false
 			while readframe >= 0 do
-				local stream_index = packet[0].stream_index
-				if stream_index == obj.VideoStreamIndex then
+				if packet[0].stream_index == obj.VideoStreamIndex then
 					local effortts = avutil.av_frame_get_best_effort_timestamp(obj.Frame)
 					
 					if effortts ~= -9223372036854775808LL then

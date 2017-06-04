@@ -1,10 +1,12 @@
+local width = 960
+local height = 720
 AquaShine = assert(love.filesystem.load("AquaShine.lua"))({
 	Entries = {
 		test = {0, "Test.lua"},
 	},
 	DefaultEntry = "test",
-	Width = 1024,	-- Letterboxing
-	Height = 576	-- Letterboxing
+	Width = width,	-- Letterboxing
+	Height = height	-- Letterboxing
 })
 
-love.window.setMode(1024, 576)
+love.window.setMode(width, height)

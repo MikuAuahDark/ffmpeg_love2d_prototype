@@ -363,7 +363,7 @@ end
 ------------------------------
 function AquaShine.MainLoop()
 	local dt
-	local font = AquaShine.LoadFont("MTLmr3m.ttf", 14)
+	local font = love.graphics.newFont(14)
 	local RenderToCanvasFunc = function()
 		local a
 		love.graphics.clear()
