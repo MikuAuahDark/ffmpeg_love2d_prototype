@@ -6,17 +6,33 @@ local avcodec = ffi.load("avcodec-57")
 local avformat = ffi.load("avformat-57")
 local avutil = ffi.load("avutil-55")
 local swscale = ffi.load("swscale-4")
+local swresample = ffi.load("swresample-2")
 local FutureGlasses = {_mt = {}, _playing = {}}
 
-local declaration = love.filesystem.read("ffmpeg_include_win_"..jit.arch..".h")
-ffi.cdef(declaration)
+local decl = love.filesystem.read("ffmpeg_include_win_"..jit.arch..".h")
+ffi.cdef(decl)
 ffi.cdef[[
 int av_image_fill_arrays(uint8_t *dst_data[4], int dst_linesize[4],
                          const uint8_t *src,
                          enum AVPixelFormat pix_fmt, int width, int height, int align);
+int av_opt_set_int     (void *obj, const char *name, int64_t     val, int search_flags);
+int av_opt_set_sample_fmt(void *obj, const char *name, enum AVSampleFormat fmt, int search_flags);
+
+typedef struct SwrContext SwrContext;
+struct SwrContext *swr_alloc(void);
+int swr_init(struct SwrContext *s);
+void swr_free(struct SwrContext **s);
 ]]
 avformat.av_register_all()
 avcodec.avcodec_register_all()
+
+function file_get_contents(x)
+	local a = assert(io.open(x, "rb"))
+	local b = a:read("*a")
+	a:close()
+	
+	return b
+end
 
 local function av_q2d(r)
 	return r.num / r.den
@@ -42,6 +58,16 @@ function FutureGlasses._mt.Pause(this)
 end
 
 function FutureGlasses._mt.Cleanup(this)
+	if this.SwrCtx ~= nil and this.SwrCtx[0] ~= nil then
+		swresample.swr_free(this.SwrCtx)
+		this.SwrCtx = nil
+	end
+	
+	if this.SwsCtx ~= nil then
+		swscale.sws_freeContext(this.SwsCtx)
+		this.SwsCtx = nil
+	end
+	
 	if this.Frame ~= nil then
 		avutil.free(this.Frame)
 		this.Frame = nil
@@ -68,124 +94,101 @@ function FutureGlasses._mt.Cleanup(this)
 	end
 end
 
-function FutureGlasses.OpenVideo(path)
+function FutureGlasses.OpenVideo(path, loadaudio)
 	local temp = {
 		Playing = false,
 		CurrentTimer = 0
 	}
-	local video_stream_index
 	local codec
-	local codeccontext
-	local fmtcontext
-	local frame, frame_rgb
-	local sws_ctx
-	
-	local function cleanup()
-		if frame ~= nil then
-			avutil.free(frame)
-			frame = nil
-		end
-		
-		if frame_rgb ~= nil then
-			avutil.free(frame_rgb)
-			frame_rgb = nil
-		end
-		
-		if codeccontext ~= nil then
-			avcodec.avcodec_close(codeccontext)
-			codeccontext = nil
-		end
-		
-		if codec ~= nil then
-			avcodec.avcodec_close(codec)
-			codec = nil
-		end
-		
-		if fmtcontext ~= nil then
-			avformat.avformat_close_input(fmtcontext)
-			fmtcontext = nil
-		end
-	end
 	
 	local function null_assert(expr, msg)
 		if not(expr) then
-			cleanup()
+			FutureGlasses._mt.Cleanup(temp)
 			assert(false, msg)
 		end
 	end
 	
 	-- Load video
-	fmtcontext = ffi.new("AVFormatContext*[1]")
-	assert(avformat.avformat_open_input(fmtcontext, path, nil, nil) == 0, "Cannot open file")
-	null_assert(avformat.avformat_find_stream_info(fmtcontext[0], nil) == 0)
+	temp.FmtContext = ffi.new("AVFormatContext*[1]")
+	assert(avformat.avformat_open_input(temp.FmtContext, path, nil, nil) == 0, "Cannot open file")
+	null_assert(avformat.avformat_find_stream_info(temp.FmtContext[0], nil) == 0)
 	
-	for i = 1, fmtcontext[0].nb_streams do
-		if fmtcontext[0].streams[i - 1].codec.codec_type == "AVMEDIA_TYPE_VIDEO" then
-			video_stream_index = i - 1
-			break
+	for i = 1, temp.FmtContext[0].nb_streams do
+		local codec_type = temp.FmtContext[0].streams[i - 1].codec.codec_type
+		
+		if codec_type == "AVMEDIA_TYPE_VIDEO" and not(temp.VideoStreamIndex) then
+			temp.VideoStreamIndex = i - 1
+		elseif codec_type == "AVMEDIA_TYPE_AUDIO" and not(temp.AudioStreamIndex) then
+			temp.AudioStreamIndex = i - 1
 		end
 	end
-	null_assert(video_stream_index, "Video stream not found")
+	null_assert(temp.VideoStreamIndex, "Video stream not found")
+	temp.VideoStream = temp.FmtContext[0].streams[temp.VideoStreamIndex]
+	
+	if temp.AudioStreamIndex and loadaudio then
+		-- Initialize audio stream
+		temp.AudioStream = temp.FmtContext[0].streams[temp.AudioStreamIndex]
+		local SampleCountLove2D = math.ceil((tonumber(temp.FmtContext[0].duration) / 1000000 + 1) * 44100)
+		
+		temp.SoundDataSampleCount = SampleCountLove2D
+		temp.SoundData = love.sound.newSoundData(SampleCountLove2D, 44100, 16, 2)
+		temp.SoundDataPointer = temp.SoundData:getPointer()
+		temp.SwrCtx = ffi.new("SwrContext*[1]")
+		temp.SwrCtx[0] = swresample.swr_alloc();
+		
+		avutil.av_opt_set_int(temp.SwrCtx[0], "in_channel_layout", temp.AudioStream.codec.channel_layout, 0);
+		avutil.av_opt_set_int(temp.SwrCtx[0], "out_channel_layout", 3, 0);
+		avutil.av_opt_set_int(temp.SwrCtx[0], "in_sample_rate", temp.AudioStream.codec.sample_rate, 0);
+		avutil.av_opt_set_int(temp.SwrCtx[0], "out_sample_rate", 44100, 0);
+		avutil.av_opt_set_sample_fmt(temp.SwrCtx[0], "in_sample_fmt", temp.AudioStream.codec.sample_fmt, 0);
+		avutil.av_opt_set_sample_fmt(temp.SwrCtx[0], "out_sample_fmt", 2, 0);
+		
+		null_assert(swresample.swr_init(temp.SwrCtx[0]) >= 0, "Failed to initialize swresample")
+	end
 	
 	-- Find decoder
-	codec = avcodec.avcodec_find_decoder(fmtcontext[0].streams[video_stream_index].codec.codec_id)
-	null_assert(codec ~= nil, "Can't find codec")
+	temp.Codec = avcodec.avcodec_find_decoder(temp.VideoStream.codec.codec_id)
+	null_assert(temp.Codec ~= nil, "Can't find codec")
 	
-	avformat.av_dump_format(fmtcontext[0], video_stream_index, "nil", 0)
-	
-	-- Get FPS
-	do
-		local videofpsrat = fmtcontext[0].streams[video_stream_index].avg_frame_rate
-		print(videofpsrat.num, videofpsrat.den)
-		
-		if videofpsrat.den == 0 then
-			videofpstrat = fmtcontext[0].streams[video_stream_index].r_frame_rate
-		end
-		
-		print(videofpsrat.num, videofpsrat.den)
-		temp.MsPerFrame = 1 / (videofpsrat.num / videofpsrat.den)
-	end
+	--avformat.av_dump_format(temp.FmtContext[0], temp.VideoStreamIndex, "nil", 0)
 	
 	-- Alloc codec context
-	codeccontext = avcodec.avcodec_alloc_context3(codec)
-	null_assert(avcodec.avcodec_copy_context(codeccontext, fmtcontext[0].streams[video_stream_index].codec) == 0, "Failed to copy context")
-	null_assert(avcodec.avcodec_open2(codeccontext, codec, nil) >= 0, "Cannot open codec")
+	temp.CodecContext = avcodec.avcodec_alloc_context3(temp.Codec)
+	null_assert(avcodec.avcodec_copy_context(temp.CodecContext, temp.VideoStream.codec) == 0, "Failed to copy context")
+	null_assert(avcodec.avcodec_open2(temp.CodecContext, temp.Codec, nil) >= 0, "Cannot open codec")
 	
 	-- Init frame
-	frame = avutil.av_frame_alloc()
-	null_assert(frame ~= nil, "Failed to initialize frame")
-	frame_rgb = avutil.av_frame_alloc()
-	null_assert(frame_rgb ~= nil, "Failed to initialize frame")
+	temp.Frame = avutil.av_frame_alloc()
+	null_assert(temp.Frame ~= nil, "Failed to initialize frame")
+	temp.FrameRGB = avutil.av_frame_alloc()
+	null_assert(temp.FrameRGB ~= nil, "Failed to initialize RGB frame")
 	
-	-- Create ImageData
-	temp.ImageData = love.image.newImageData(codeccontext.width, codeccontext.height)
+	-- We don't need to calculate the memory size. RGBA is always w*h*4
+	-- And ImageData will do the memory allocation automatically with just width and height information
+	temp.ImageData = love.image.newImageData(temp.CodecContext.width, temp.CodecContext.height)
 	temp.Image = love.graphics.newImage(temp.ImageData)
-	temp.ImageDataPtr = ffi.cast("uint8_t*", temp.ImageData:getPointer())
 	
+	-- Instead of creating new memory to store RGBA decoded pixels and do memcpy later
+	-- Just pass the ImageData pointer directly to FFmpeg
+	temp.ImageDataPtr = ffi.cast("uint8_t*", temp.ImageData:getPointer())
 	avutil.av_image_fill_arrays(
-		frame_rgb.data, frame_rgb.linesize, temp.ImageDataPtr,
-		"AV_PIX_FMT_RGBA", codeccontext.width, codeccontext.height, 1
+		temp.FrameRGB.data, temp.FrameRGB.linesize, temp.ImageDataPtr,
+		"AV_PIX_FMT_RGBA", temp.CodecContext.width, temp.CodecContext.height, 1
 	)
 	
-	sws_ctx = swscale.sws_getContext(
-		codeccontext.width,
-		codeccontext.height,
-		codeccontext.pix_fmt,
-		codeccontext.width,
-		codeccontext.height,
-		"AV_PIX_FMT_RGBA",
+	-- Then we create our sws context
+	temp.SwsCtx = swscale.sws_getContext(
+		temp.CodecContext.width,
+		temp.CodecContext.height,
+		temp.CodecContext.pix_fmt,
+		temp.CodecContext.width,
+		temp.CodecContext.height,
+		"AV_PIX_FMT_RGBA",		-- Don't forget that ImageData expects RGBA values
 		2, -- SWS_BILINEAR
 		nil, nil, nil
 	)
 	
-	temp.FmtContext = fmtcontext
-	temp.VideoStreamIndex = video_stream_index
-	temp.Codec = codec
-	temp.CodecContext = codeccontext
-	temp.Frame = frame
-	temp.FrameRGB = frame_rgb
-	temp.SwsCtx = sws_ctx
-	temp.TimeBase = fmtcontext[0].streams[video_stream_index].time_base
+	temp.TimeBase = temp.VideoStream.time_base
 	
 	return setmetatable(temp, {__index = FutureGlasses._mt})
 end
@@ -198,21 +201,23 @@ function FutureGlasses.Update(deltaT)
 		local obj = FutureGlasses._playing[i]
 		obj.CurrentTimer = obj.CurrentTimer + deltaT
 		
-		while obj.CurrentTimer >= obj.MsPerFrame do
+		while obj.PresentationTS == nil or obj.CurrentTimer >= obj.PresentationTS do
 			-- Step
 			framefinished[0] = 0
 			
 			local readframe = avformat.av_read_frame(obj.FmtContext[0], packet)
+			local stop_decode = false
 			while readframe >= 0 do
-				if packet[0].stream_index == obj.VideoStreamIndex then
+				local stream_index = packet[0].stream_index
+				if stream_index == obj.VideoStreamIndex then
 					local effortts = avutil.av_frame_get_best_effort_timestamp(obj.Frame)
+					
 					if effortts ~= -9223372036854775808LL then
-						print(effortts, tonumber(effortts) / obj.TimeBase.den * obj.TimeBase.num)
-					else
-						io.write("Unknown PTS\n")
+						obj.PresentationTS = tonumber(effortts - obj.FmtContext[0].start_time) / obj.TimeBase.den * obj.TimeBase.num
 					end
 					
 					avcodec.avcodec_decode_video2(obj.CodecContext, obj.Frame, framefinished, packet)
+					
 				end
 				
 				avcodec.av_free_packet(packet)
@@ -233,11 +238,10 @@ function FutureGlasses.Update(deltaT)
 			if readframe >= 0 then
 				obj.Image:refresh()
 			else
+				print("Readframe returns less than 0", readframe)
 				obj.Playing = false
 				table.remove(FutureGlasses._playing, i)
 			end
-			
-			obj.CurrentTimer = obj.CurrentTimer - obj.MsPerFrame
 		end
 	end
 end

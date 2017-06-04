@@ -5,7 +5,7 @@ local videoobj
 local audio
 
 -- Please change
-local desiredfile = [[D:/[HD] Touhou - Bad Apple!! [PV] (Shadow Art).mp4]]
+local desiredfile = [[D:/【試聴動画】Aqours 3rdシングル「HAPPY PARTY TRAIN」.mp4]]
 
 function Test.Start()
 	
@@ -14,6 +14,7 @@ function Test.Start()
 	videoobj:Play()
 	
 	-- If you don't need audio, simply comment 7 lines below
+	--[[
 	local x = io.popen("ffmpeg -i \""..desiredfile.."\" -vn -c:a pcm_s16le -f s16le -ar 44100 -ac 2 - 2> nul", "rb")
 	local y = x:read("*a")
 	x:close()
@@ -21,6 +22,7 @@ function Test.Start()
 	ffi.copy(audio:getPointer(), y)
 	audio = love.audio.newSource(audio)
 	audio:play()
+	]]
 end
 
 function Test.Update(deltaT)
