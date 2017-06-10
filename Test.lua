@@ -5,7 +5,7 @@ local videoobj
 local audio
 
 -- Please change
-local desiredfile = [[D:/[HD] Touhou - Bad Apple!! [PV] (Shadow Art).mp4]]
+local desiredfile = [[D:\Idlers\video_assembler_output\l.mp4]]
 
 function Test.Start()
 	-- Testing. Hardcoded path atm

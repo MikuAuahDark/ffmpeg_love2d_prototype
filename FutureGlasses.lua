@@ -319,9 +319,10 @@ function FutureGlasses.Update(deltaT)
 			if readframe >= 0 then
 				obj.Image:refresh()
 			else
-				print("Readframe returns less than 0", readframe)
 				obj.Playing = false
 				table.remove(FutureGlasses._playing, i)
+				
+				break
 			end
 		end
 	end
